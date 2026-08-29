@@ -1,19 +1,17 @@
 import asyncio
 import json
 import os
-import re
 from pathlib import Path
 
 import httpx
-from playwright.async_api import async_playwright
 
 WATCHLIST = Path("watchlist.txt")
 STATE = Path("state.json")
 
+REEF_KEY = os.getenv("REEF_KEY", "").strip()
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-IN_STOCK_ACTIONS = {"size-in-stock", "size-low-on-stock"}
 
 
 def load_watchlist():
@@ -21,13 +19,14 @@ def load_watchlist():
         return []
 
     urls = []
+
     for raw in WATCHLIST.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
 
         if not line or line.startswith("#"):
             continue
 
-        if "zara.com/tr/tr/" in line:
+        if "zara.com/" in line:
             urls.append(line)
 
     return list(dict.fromkeys(urls))
@@ -38,24 +37,33 @@ def load_state():
         return {}
 
     try:
-        return json.loads(STATE.read_text(encoding="utf-8"))
+        return json.loads(
+            STATE.read_text(encoding="utf-8")
+        )
     except Exception:
         return {}
 
 
 def save_state(state):
     STATE.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2),
+        json.dumps(
+            state,
+            ensure_ascii=False,
+            indent=2
+        ),
         encoding="utf-8"
     )
 
 
 async def telegram_send(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram ayarlanmamış.")
+        print("Telegram henüz ayarlanmamış.")
         return
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
 
     async with httpx.AsyncClient(timeout=20) as client:
         response = await client.post(
@@ -63,140 +71,158 @@ async def telegram_send(text):
             json={
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": text,
-                "disable_web_page_preview": False,
-            },
+                "disable_web_page_preview": False
+            }
         )
 
         response.raise_for_status()
 
 
-async def inspect_product(page, url):
-    await page.goto(
-        url,
-        wait_until="domcontentloaded",
-        timeout=60000
+async def fetch_product(client, url):
+    if not REEF_KEY:
+        raise RuntimeError("REEF_KEY tanımlı değil.")
+
+    response = await client.post(
+        "https://api.reefapi.com/zara/v1/product_detail",
+        headers={
+            "x-api-key": REEF_KEY,
+            "content-type": "application/json"
+        },
+        json={
+            "url": url,
+            "market": "tr",
+            "include_composition": False
+        },
+        timeout=40
     )
 
-    await page.wait_for_timeout(1500)
+    response.raise_for_status()
 
-    title = "Zara ürünü"
+    payload = response.json()
 
-    for selector in [
-        "h1",
-        '[data-qa-qualifier="product-detail-info-name"]',
-        '[data-qa-qualifier="product-detail-name"]',
-    ]:
-        try:
-            element = page.locator(selector).first
+    if not payload.get("ok"):
+        raise RuntimeError(
+            f"ReefAPI hata: {payload.get('error')}"
+        )
 
-            if await element.count():
-                text = (await element.inner_text()).strip()
+    return payload.get("data") or {}
 
-                if text:
-                    title = text
-                    break
-        except Exception:
-            pass
 
-    price = ""
+def walk_sizes(value, results):
+    if isinstance(value, dict):
 
-    for selector in [
-        '[data-qa-qualifier="price-amount-current"]',
-        '[data-qa-qualifier="price-amount"]',
-        ".money-amount__main",
-    ]:
-        try:
-            element = page.locator(selector).first
+        size_name = (
+            value.get("name")
+            or value.get("size")
+            or value.get("label")
+            or value.get("display_name")
+        )
 
-            if await element.count():
-                text = (await element.inner_text()).strip()
+        stock_value = value.get("in_stock")
 
-                if text:
-                    price = text
-                    break
-        except Exception:
-            pass
+        if (
+            stock_value is True
+            and size_name
+        ):
+            results.append(str(size_name).strip())
 
-    body_text = ""
+        for child in value.values():
+            walk_sizes(child, results)
 
-    try:
-        body_text = (
-            await page.locator("body").inner_text()
-        ).lower()
-    except Exception:
-        pass
+    elif isinstance(value, list):
 
-    coming_soon = (
-        "coming soon" in body_text
-        or "yakında" in body_text
-    )
+        for child in value:
+            walk_sizes(child, results)
 
-    try:
-        add_button = page.locator(
-            '[data-qa-action="add-to-cart"]'
-        ).first
 
-        if await add_button.count():
-            await add_button.click(timeout=4000)
+def find_first(data, keys):
+    if isinstance(data, dict):
 
-    except Exception:
-        try:
-            button = page.get_by_role(
-                "button",
-                name=re.compile(
-                    r"sepete ekle|add to bag",
-                    re.I
-                ),
-            ).first
+        for key in keys:
+            if key in data and data[key] not in (
+                None,
+                "",
+                []
+            ):
+                return data[key]
 
-            if await button.count():
-                await button.click(timeout=4000)
+        for value in data.values():
+            result = find_first(value, keys)
 
-        except Exception:
-            pass
+            if result not in (
+                None,
+                "",
+                []
+            ):
+                return result
 
-    await page.wait_for_timeout(1000)
+    elif isinstance(data, list):
 
+        for value in data:
+            result = find_first(value, keys)
+
+            if result not in (
+                None,
+                "",
+                []
+            ):
+                return result
+
+    return None
+
+
+def parse_product(data):
     sizes = []
 
-    locator = page.locator(
-        '[data-qa-action="size-in-stock"], '
-        '[data-qa-action="size-low-on-stock"]'
+    walk_sizes(data, sizes)
+
+    sizes = list(
+        dict.fromkeys(
+            size
+            for size in sizes
+            if size
+        )
     )
 
-    try:
-        count = await locator.count()
-    except Exception:
-        count = 0
+    title = find_first(
+        data,
+        [
+            "name",
+            "product_name",
+            "display_name"
+        ]
+    )
 
-    for i in range(count):
-        element = locator.nth(i)
+    reference = find_first(
+        data,
+        [
+            "display_reference",
+            "reference"
+        ]
+    )
 
-        try:
-            text = (await element.inner_text()).strip()
+    price = find_first(
+        data,
+        [
+            "amount",
+            "price_amount"
+        ]
+    )
 
-            if not text:
-                text = (
-                    await element.get_attribute("aria-label")
-                    or ""
-                ).strip()
-
-            if text:
-                sizes.append(text)
-
-        except Exception:
-            continue
-
-    sizes = list(dict.fromkeys(sizes))
-
-    if coming_soon:
-        sizes = []
+    currency = find_first(
+        data,
+        [
+            "currency",
+            "currency_code"
+        ]
+    )
 
     return {
-        "title": title,
+        "title": str(title or "Zara ürünü"),
+        "sizes": sorted(sizes),
+        "reference": str(reference or ""),
         "price": price,
-        "sizes": sizes,
-        "coming_soon": coming_soon,
+        "currency": str(currency or "TRY")
     }
 
 
@@ -207,33 +233,38 @@ async def main():
         print("watchlist.txt boş.")
         return
 
+    if not REEF_KEY:
+        raise RuntimeError(
+            "GitHub Secret olarak REEF_KEY eklenmeli."
+        )
+
     previous = load_state()
     current = {}
 
-    async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(
-            headless=True
-        )
+    async with httpx.AsyncClient() as client:
 
-        context = await browser.new_context(
-            locale="tr-TR",
-            timezone_id="Europe/Istanbul",
-        )
+        for index, url in enumerate(
+            urls,
+            start=1
+        ):
 
-        page = await context.new_page()
-
-        for index, url in enumerate(urls, start=1):
             try:
-                data = await inspect_product(page, url)
-
-                old_sizes = set(
-                    previous.get(url, {}).get(
-                        "sizes",
-                        []
-                    )
+                raw = await fetch_product(
+                    client,
+                    url
                 )
 
-                new_sizes = set(data["sizes"])
+                data = parse_product(raw)
+
+                new_sizes = set(
+                    data["sizes"]
+                )
+
+                old_sizes = set(
+                    previous
+                    .get(url, {})
+                    .get("sizes", [])
+                )
 
                 current[url] = data
 
@@ -243,39 +274,58 @@ async def main():
                     f"{data['sizes'] or 'TÜKENDİ'}"
                 )
 
+                # SADECE:
+                # TÜKENDİ -> STOK AÇILDI
                 if not old_sizes and new_sizes:
+
                     sizes_text = ", ".join(
                         sorted(new_sizes)
                     )
 
                     message = (
-                        "🚨 ZARA STOK DÖNÜŞÜ\n"
+                        "🚨 ZARA STOK AÇILDI\n\n"
                         f"{data['title']}\n"
                         f"Beden: {sizes_text}"
                     )
 
-                    if data["price"]:
+                    if data["price"] not in (
+                        None,
+                        ""
+                    ):
                         message += (
-                            f"\nFiyat: {data['price']}"
+                            f"\nFiyat: "
+                            f"{data['price']} "
+                            f"{data['currency']}"
                         )
 
-                    message += f"\n{url}"
+                    if data["reference"]:
+                        message += (
+                            f"\nKod: "
+                            f"{data['reference']}"
+                        )
 
-                    await telegram_send(message)
+                    message += (
+                        f"\n\n{url}"
+                    )
+
+                    await telegram_send(
+                        message
+                    )
 
             except Exception as error:
+
                 print(
-                    f"HATA: {url} "
+                    f"HATA: {url}\n"
                     f"{type(error).__name__}: "
                     f"{error}"
                 )
 
+                # Bir API hatası stok yok diye
+                # kaydedilmesin.
                 if url in previous:
                     current[url] = previous[url]
 
-            await page.wait_for_timeout(1800)
-
-        await browser.close()
+            await asyncio.sleep(1)
 
     save_state(current)
 
